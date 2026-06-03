@@ -2,23 +2,15 @@
 
 Arduino sketches for ESP32-based synth and visualiser experiments. Each sketch lives in its own folder matching the sketch name (Arduino IDE requirement).
 
-## Boards
+## Board
 
-Two boards are targeted in this repo. Most recent work is on the C3.
-
-### ESP32-C3 Super Mini with 0.42" OLED (current focus)
+### ESP32-C3 Super Mini with 0.42" OLED
 - ESP32-C3, single-core RISC-V, 160 MHz, **no FPU**
 - 0.42" SSD1306 OLED: 72×40 visible pixels offset on a 128×64 framebuffer
 - Native USB-CDC + USB-JTAG (no external USB-UART chip, no driver needed on macOS)
 - Built-in LED on **GPIO 8 (active-low)**
 - BOOT button on **GPIO 9**
 - Pads labeled `RX` and `TX` on the board correspond to **GPIO 20** and **GPIO 21**
-
-### ESP32-2432S028R "CYD" (Cheap Yellow Display)
-- ESP32 dual-core, 240 MHz
-- 2.8" TFT (ILI9341, 320×240), resistive touch (XPT2046)
-- Built-in RGB LED, microSD slot
-- CYD-specific pin map lives in [`CLAUDE.md`](CLAUDE.md)
 
 ---
 
@@ -103,18 +95,16 @@ VCC must be **3V3** — the module drives its OUT pin at VCC level and the C3's 
 
 ## Sketches
 
-| Sketch | Board | Description |
-|---|---|---|
-| `HelloWorld/` | any | First serial smoke test |
-| `BlinkC3/` | C3 | LED blink — note GPIO 8 is active-low |
-| `LEDCFade/` | ESP32 | LEDC PWM fade |
-| `OLEDHello/` | C3 | 0.42" OLED hello via U8g2 (handles panel offset) |
-| `WaveMorph/` | C3 | Sine → saw → square morph visualised on the OLED |
-| `WaveMorphAudio/` | C3 | Same morph made audible via MAX98357A. Uses band-limited Fourier-series saw/square + audio-rate integer crossfade to eliminate aliasing and buffer-boundary clicks |
-| `Disco80/` | C3 | 118 BPM four-on-the-floor disco loop: pitched-sine kick with pitch sweep, noise hi-hat, octave-jumper bass, sine lead riff |
-| `DarkSynth/` | C3 | Slow synthwave drone in D minor through a 1-pole LPF — three saw voices, long decays, a 13.5 s loop |
-| `Acid303/` | C3 | TB-303-style acid bassline: saw oscillator → 2-pole Chamberlin state-variable resonant LPF with filter envelope, slides, accents. Live control via the 4 pots; touch sensors for octave-up and pattern variant |
-| `DiscoBall/`, `FSharpTone/` | CYD | Earlier display/touch experiments |
+| Sketch | Description |
+|---|---|
+| `BlinkC3/` | LED blink — note GPIO 8 is active-low |
+| `OLEDHello/` | 0.42" OLED hello via U8g2 (handles panel offset) |
+| `WaveMorph/` | Sine → saw → square morph visualised on the OLED |
+| `WaveMorphAudio/` | Same morph made audible via MAX98357A. Uses band-limited Fourier-series saw/square + audio-rate integer crossfade to eliminate aliasing and buffer-boundary clicks |
+| `Disco80/` | 118 BPM four-on-the-floor disco loop: pitched-sine kick with pitch sweep, noise hi-hat, octave-jumper bass, sine lead riff |
+| `DarkSynth/` | Slow synthwave drone in D minor through a 1-pole LPF — three saw voices, long decays, a 13.5 s loop |
+| `Acid303/` | TB-303-style acid bassline: saw oscillator → 2-pole Chamberlin state-variable resonant LPF with filter envelope, slides, accents. Live control via the 4 pots; touch sensors for octave-up and pattern variant |
+| `HelloWorld/`, `LEDCFade/`, `DiscoBall/`, `FSharpTone/` | Legacy experiments — kept in tree for reference |
 
 ---
 
@@ -123,10 +113,10 @@ VCC must be **3V3** — the module drives its OUT pin at VCC level and the C3's 
 `arduino-cli` is the build path. Arduino IDE works too with the same FQBN.
 
 ### FQBN
-**Always use `CDCOnBoot=cdc` for the C3 sketches** — without it, `Serial.print` is routed to UART0 (GPIO 20/21) instead of USB CDC, and the serial monitor stays silent.
+**Always use `CDCOnBoot=cdc`** — without it, `Serial.print` is routed to UART0 (GPIO 20/21) instead of USB CDC, and the serial monitor stays silent.
 
 ```bash
-# Compile (C3)
+# Compile
 arduino-cli compile --fqbn "esp32:esp32:esp32c3:CDCOnBoot=cdc" Acid303/
 
 # Find the port (re-enumerates each replug)
@@ -146,13 +136,6 @@ arduino-cli monitor -p /dev/cu.usbmodem<NNN> --config baudrate=115200
 
 ### Port re-enumeration on macOS
 The C3's native USB shows up as `/dev/cu.usbmodem<NNN>`. The trailing digits **change every time the board is unplugged** (e.g. `usbmodem11101` → `usbmodem1101` → `usbmodem101`). Always re-check `arduino-cli board list` after replugging.
-
-### CYD board
-Different FQBN and special baud rate:
-```bash
-arduino-cli compile --fqbn esp32:esp32:esp32 <CYDSketch>/
-arduino-cli upload -p /dev/cu.usbserial-* --fqbn esp32:esp32:esp32 --upload-property upload.speed=115200 <CYDSketch>/
-```
 
 ---
 
@@ -191,4 +174,4 @@ When resuming this project:
 7. **Arduino IDE auto-generates function prototypes** at the top of `.ino` files. Functions taking user-defined struct types as parameters fail to compile because the prototype is placed before the struct definition. Workaround: don't pass structs as parameters in `.ino` files — give each voice its own dedicated function (`process_bass()`, `process_lead()` etc.), or move the struct to a `.h` file.
 8. **Pin-name conflicts.** ESP32 Arduino core defines `A0`, `A1`, `A2`… as analog-pin macros. Don't name musical-note constants `A2`, `A3` etc. — use `NOTE_A2`, `NOTE_A3`.
 9. **Port re-enumerates on replug** — always run `arduino-cli board list` before uploading after disconnecting the board.
-10. **CYD specifics live in `CLAUDE.md`** — don't confuse them with C3 specifics here.
+10. **Only one board is in use** — the ESP32-C3 Super Mini with 0.42" OLED. Don't reintroduce CYD/dual-board pinouts.
