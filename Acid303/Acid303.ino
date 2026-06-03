@@ -6,9 +6,14 @@
 U8G2_SSD1306_72X40_ER_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 I2SClass i2s;
 
-constexpr int I2S_BCLK = 4;
-constexpr int I2S_LRC  = 3;
-constexpr int I2S_DIN  = 1;
+constexpr int I2S_BCLK = 7;
+constexpr int I2S_LRC  = 10;
+constexpr int I2S_DIN  = 20;
+
+constexpr int POT_CUTOFF_PIN = 0;
+constexpr int POT_RESO_PIN   = 1;
+constexpr int POT_ENVMOD_PIN = 3;
+constexpr int POT_DECAY_PIN  = 4;
 
 constexpr int SAMPLE_RATE = 22050;
 constexpr int AUDIO_BUF = 256;
@@ -77,7 +82,15 @@ int32_t svf_low = 0;
 int32_t svf_band = 0;
 int32_t filt_base_f = 0;
 
-constexpr int32_t Q_RESO = 9000;
+int32_t q_reso = 9000;
+int     filter_decay_ms = 220;
+int32_t env_amount_normal_f = 33000;
+int32_t env_amount_accent_f = 57632;
+
+uint16_t pot_cutoff = 2048;
+uint16_t pot_reso   = 2048;
+uint16_t pot_envmod = 2048;
+uint16_t pot_decay  = 2048;
 
 static int16_t saw_sample(uint32_t phase) {
   return (int16_t)((int32_t)phase >> 16);
@@ -120,8 +133,30 @@ static void trigger_note(int step) {
   amp_env_decay_q16 = amp_peak / decay_samples(slide_in ? 220 : 140);
 
   filt_env_q16 = 65536;
-  filt_env_decay_q16 = 65536 / decay_samples(st.accent ? 380 : 220);
-  filt_env_amount_f = st.accent ? hz_to_f_q16(3200.0f) : hz_to_f_q16(1700.0f);
+  int fd_ms = st.accent ? (filter_decay_ms * 17 / 10) : filter_decay_ms;
+  if (fd_ms < 20) fd_ms = 20;
+  filt_env_decay_q16 = 65536 / decay_samples(fd_ms);
+  filt_env_amount_f = st.accent ? env_amount_accent_f : env_amount_normal_f;
+}
+
+static void read_pots() {
+  pot_cutoff = (uint16_t)((pot_cutoff * 7u + analogRead(POT_CUTOFF_PIN)) >> 3);
+  pot_reso   = (uint16_t)((pot_reso   * 7u + analogRead(POT_RESO_PIN))   >> 3);
+  pot_envmod = (uint16_t)((pot_envmod * 7u + analogRead(POT_ENVMOD_PIN)) >> 3);
+  pot_decay  = (uint16_t)((pot_decay  * 7u + analogRead(POT_DECAY_PIN))  >> 3);
+
+  uint32_t pc_sq = ((uint32_t)pot_cutoff * pot_cutoff) >> 12;
+  float cutoff_hz = 60.0f + (pc_sq * (2500.0f - 60.0f) / 4095.0f);
+  filt_base_f = hz_to_f_q16(cutoff_hz);
+
+  q_reso = 28000 - ((int32_t)pot_reso * (28000 - 4000)) / 4095;
+
+  int32_t emax = hz_to_f_q16(4000.0f);
+  env_amount_normal_f = ((int32_t)pot_envmod * (emax >> 1)) / 4095;
+  env_amount_accent_f = ((int32_t)pot_envmod * emax) / 4095;
+
+  uint32_t pd_sq = ((uint32_t)pot_decay * pot_decay) >> 12;
+  filter_decay_ms = 30 + (pd_sq * (1200 - 30)) / 4095;
 }
 
 static void render_display() {
@@ -169,6 +204,8 @@ void setup() {
 }
 
 void loop() {
+  read_pots();
+
   for (int i = 0; i < AUDIO_BUF; i++) {
     if (samples_into_step == 0 || current_step < 0) {
       current_step = (current_step + 1) % STEPS;
@@ -201,7 +238,7 @@ void loop() {
 
     int32_t old_band = svf_band;
     svf_low = svf_low + (int32_t)(((int64_t)f * old_band) >> 16);
-    int32_t high = voice_out - svf_low - (int32_t)(((int64_t)Q_RESO * old_band) >> 16);
+    int32_t high = voice_out - svf_low - (int32_t)(((int64_t)q_reso * old_band) >> 16);
     svf_band = old_band + (int32_t)(((int64_t)f * high) >> 16);
 
     if (svf_low  >  (1 << 27)) svf_low  =  (1 << 27);
