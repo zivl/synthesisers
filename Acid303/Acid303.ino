@@ -3,6 +3,18 @@
 #include <ESP_I2S.h>
 #include <math.h>
 
+static inline uint32_t inc_for_hz(float hz);
+static int16_t         saw_sample(uint32_t phase);
+static int             decay_samples(int ms);
+static int32_t         hz_to_f_q16(float hz);
+static void            trigger_note(int step);
+static void            read_pots();
+static void            read_touch();
+static void            draw_indicator(int x, int label_x, char ch, bool active);
+static void            render_display();
+void setup();
+void loop();
+
 U8G2_SSD1306_72X40_ER_F_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
 I2SClass i2s;
 
@@ -10,10 +22,13 @@ constexpr int I2S_BCLK = 7;
 constexpr int I2S_LRC  = 10;
 constexpr int I2S_DIN  = 20;
 
-constexpr int POT_CUTOFF_PIN = 0;
-constexpr int POT_RESO_PIN   = 1;
-constexpr int POT_ENVMOD_PIN = 3;
-constexpr int POT_DECAY_PIN  = 4;
+constexpr int POT_CUTOFF_PIN    = 0;
+constexpr int POT_RESO_PIN      = 1;
+constexpr int POT_ENVMOD_PIN    = 3;
+constexpr int POT_DECAY_PIN     = 4;
+
+constexpr int TOUCH_OCTAVE_PIN  = 21;  // active-HIGH, no A-pad bridge
+constexpr int TOUCH_PATTERN_PIN = 2;   // active-LOW, A-pad bridged on module
 
 constexpr int SAMPLE_RATE = 22050;
 constexpr int AUDIO_BUF = 256;
@@ -31,10 +46,12 @@ static inline uint32_t inc_for_hz(float hz) {
   return (uint32_t)((double)hz * 4294967296.0 / (double)SAMPLE_RATE);
 }
 
+constexpr float NOTE_E2  = 82.41f;
 constexpr float NOTE_F2  = 87.31f;
 constexpr float NOTE_G2  = 98.00f;
 constexpr float NOTE_GS2 = 103.83f;
 constexpr float NOTE_A2  = 110.00f;
+constexpr float NOTE_B2  = 123.47f;
 constexpr float NOTE_C3  = 130.81f;
 constexpr float NOTE_E3  = 164.81f;
 constexpr float NOTE_G3  = 196.00f;
@@ -46,24 +63,60 @@ struct Step {
   bool  slide;
 };
 
-const Step pattern[STEPS] = {
-  {NOTE_A2, true,  false},
-  {0,       false, false},
-  {NOTE_A2, false, false},
-  {NOTE_A3, false, true},
-  {NOTE_A2, false, false},
-  {0,       false, false},
-  {NOTE_C3, true,  true},
-  {NOTE_C3, false, false},
-  {NOTE_A2, false, false},
-  {0,       false, false},
-  {NOTE_A2, false, false},
-  {NOTE_G2, false, true},
-  {NOTE_A2, true,  false},
-  {0,       false, false},
-  {NOTE_A2, false, false},
-  {NOTE_GS2,false, false},
+// Pattern A — A minor acid groove (original)
+const Step pattern_a[STEPS] = {
+  {NOTE_A2,  true,  false},
+  {0,        false, false},
+  {NOTE_A2,  false, false},
+  {NOTE_A3,  false, true },
+  {NOTE_A2,  false, false},
+  {0,        false, false},
+  {NOTE_C3,  true,  true },
+  {NOTE_C3,  false, false},
+  {NOTE_A2,  false, false},
+  {0,        false, false},
+  {NOTE_A2,  false, false},
+  {NOTE_G2,  false, true },
+  {NOTE_A2,  true,  false},
+  {0,        false, false},
+  {NOTE_A2,  false, false},
+  {NOTE_GS2, false, false},
 };
+
+// Pattern B — E minor/pentatonic variant
+const Step pattern_b[STEPS] = {
+  {NOTE_E3,  true,  false},
+  {0,        false, false},
+  {NOTE_E3,  false, false},
+  {0,        false, false},
+  {NOTE_A2,  false, true },
+  {NOTE_E3,  true,  false},
+  {0,        false, false},
+  {NOTE_G2,  false, false},
+  {0,        false, false},
+  {NOTE_E3,  false, false},
+  {0,        false, false},
+  {NOTE_B2,  false, true },
+  {NOTE_E3,  true,  false},
+  {0,        false, false},
+  {NOTE_G2,  false, false},
+  {NOTE_E2,  false, false},
+};
+
+bool touch_octave  = false;
+bool touch_pattern = false;
+const Step* active_pattern = pattern_a;
+
+// Pot change indicator
+int      active_pot_idx       = -1;
+uint32_t pot_display_until_ms = 0;
+
+// MACD threshold: |fast_EMA - slow_EMA| needed to flag a pot as moving.
+// fast (α=½) leads slow (α=⅛) by ~6× the per-call rate, so even slow
+// deliberate turning produces >>20; ADC noise produces ≈10–13.
+constexpr int      POT_CHANGE_THRESH = 20;
+constexpr uint32_t POT_DISPLAY_MS   = 2000;
+static const char* const POT_NAMES[] = {"CUT", "RES", "ENV", "DEC"};
 
 uint32_t osc_phase = 0;
 uint32_t osc_inc = 0;
@@ -87,10 +140,17 @@ int     filter_decay_ms = 220;
 int32_t env_amount_normal_f = 33000;
 int32_t env_amount_accent_f = 57632;
 
+// Slow EMAs — used for audio parameters
 uint16_t pot_cutoff = 2048;
 uint16_t pot_reso   = 2048;
 uint16_t pot_envmod = 2048;
 uint16_t pot_decay  = 2048;
+
+// Fast EMAs (α=½) — used only for MACD pot-change detection
+uint16_t fast_cutoff = 2048;
+uint16_t fast_reso   = 2048;
+uint16_t fast_envmod = 2048;
+uint16_t fast_decay  = 2048;
 
 static int16_t saw_sample(uint32_t phase) {
   return (int16_t)((int32_t)phase >> 16);
@@ -106,15 +166,16 @@ static int32_t hz_to_f_q16(float hz) {
 }
 
 static void trigger_note(int step) {
-  const Step& st = pattern[step];
+  const Step& st = active_pattern[step];
   if (st.note <= 0.0f) {
     return;
   }
 
-  uint32_t new_inc = inc_for_hz(st.note);
+  float note_hz = st.note * (touch_octave ? 2.0f : 1.0f);
+  uint32_t new_inc = inc_for_hz(note_hz);
 
   int prev = (step - 1 + STEPS) % STEPS;
-  bool slide_in = pattern[prev].slide && pattern[prev].note > 0.0f;
+  bool slide_in = active_pattern[prev].slide && active_pattern[prev].note > 0.0f;
 
   if (slide_in && osc_inc > 0) {
     slide_remaining = decay_samples(45);
@@ -140,10 +201,41 @@ static void trigger_note(int step) {
 }
 
 static void read_pots() {
-  pot_cutoff = (uint16_t)((pot_cutoff * 7u + analogRead(POT_CUTOFF_PIN)) >> 3);
-  pot_reso   = (uint16_t)((pot_reso   * 7u + analogRead(POT_RESO_PIN))   >> 3);
-  pot_envmod = (uint16_t)((pot_envmod * 7u + analogRead(POT_ENVMOD_PIN)) >> 3);
-  pot_decay  = (uint16_t)((pot_decay  * 7u + analogRead(POT_DECAY_PIN))  >> 3);
+  // Sample each GPIO exactly once
+  int raw[4] = {
+    analogRead(POT_CUTOFF_PIN),
+    analogRead(POT_RESO_PIN),
+    analogRead(POT_ENVMOD_PIN),
+    analogRead(POT_DECAY_PIN)
+  };
+
+  // Slow EMAs (α=⅛) — audio parameters
+  pot_cutoff = (uint16_t)((pot_cutoff * 7u + (uint16_t)raw[0]) >> 3);
+  pot_reso   = (uint16_t)((pot_reso   * 7u + (uint16_t)raw[1]) >> 3);
+  pot_envmod = (uint16_t)((pot_envmod * 7u + (uint16_t)raw[2]) >> 3);
+  pot_decay  = (uint16_t)((pot_decay  * 7u + (uint16_t)raw[3]) >> 3);
+
+  // Fast EMAs (α=½) — lead the slow EMAs by ~6× the per-call rate when moving
+  fast_cutoff = (uint16_t)((fast_cutoff + (uint16_t)raw[0]) >> 1);
+  fast_reso   = (uint16_t)((fast_reso   + (uint16_t)raw[1]) >> 1);
+  fast_envmod = (uint16_t)((fast_envmod + (uint16_t)raw[2]) >> 1);
+  fast_decay  = (uint16_t)((fast_decay  + (uint16_t)raw[3]) >> 1);
+
+  // MACD: |fast − slow| is large only when the pot is actually moving
+  int diffs[4] = {
+    abs((int)fast_cutoff - (int)pot_cutoff),
+    abs((int)fast_reso   - (int)pot_reso),
+    abs((int)fast_envmod - (int)pot_envmod),
+    abs((int)fast_decay  - (int)pot_decay)
+  };
+  int best = -1, best_d = POT_CHANGE_THRESH - 1;
+  for (int i = 0; i < 4; i++) {
+    if (diffs[i] > best_d) { best_d = diffs[i]; best = i; }
+  }
+  if (best >= 0) {
+    active_pot_idx       = best;
+    pot_display_until_ms = millis() + POT_DISPLAY_MS;
+  }
 
   uint32_t pc_sq = ((uint32_t)pot_cutoff * pot_cutoff) >> 12;
   float cutoff_hz = 60.0f + (pc_sq * (2500.0f - 60.0f) / 4095.0f);
@@ -159,28 +251,73 @@ static void read_pots() {
   filter_decay_ms = 30 + (pd_sq * (1200 - 30)) / 4095;
 }
 
+static void read_touch() {
+  touch_octave  = (digitalRead(TOUCH_OCTAVE_PIN) == HIGH);
+  touch_pattern = (digitalRead(TOUCH_PATTERN_PIN) == LOW);  // A-pad bridged = active-LOW
+}
+
+// Draw an 8×8 indicator box. Filled+inverted text when active, outline+normal text when not.
+static void draw_indicator(int x, int label_x, char ch, bool active) {
+  if (active) {
+    u8g2.drawBox(x, 0, 8, 8);
+    u8g2.setDrawColor(0);
+    u8g2.setCursor(label_x, 7);
+    u8g2.print(ch);
+    u8g2.setDrawColor(1);
+  } else {
+    u8g2.drawFrame(x, 0, 8, 8);
+    u8g2.setCursor(label_x, 7);
+    u8g2.print(ch);
+  }
+}
+
 static void render_display() {
   u8g2.clearBuffer();
-
   u8g2.setFont(u8g2_font_5x7_tr);
+
+  // Header: "303  130  [P][O]"
+  // P = pattern (A/B), O = octave (^)
   u8g2.setCursor(0, 7);
   u8g2.print("303");
-  u8g2.setCursor(24, 7);
+  u8g2.setCursor(20, 7);
   u8g2.print((int)BPM);
 
+  // Pattern indicator box at x=44; octave indicator at x=55
+  draw_indicator(44, 46, touch_pattern ? 'B' : 'A', touch_pattern);
+  draw_indicator(55, 57, '^', touch_octave);
+
+  // Step sequencer rows
   for (int s = 0; s < STEPS; s++) {
     int x = s * 4 + 4;
-    bool has_note = pattern[s].note > 0.0f;
+    bool has_note = active_pattern[s].note > 0.0f;
     if (s == current_step) {
       u8g2.drawBox(x, 17, 3, 6);
     }
     if (has_note) {
-      if (pattern[s].accent) u8g2.drawBox(x, 25, 3, 4);
-      else                   u8g2.drawFrame(x, 25, 3, 4);
+      if (active_pattern[s].accent) u8g2.drawBox(x, 25, 3, 4);
+      else                          u8g2.drawFrame(x, 25, 3, 4);
     }
-    if (pattern[s].slide) {
+    if (active_pattern[s].slide) {
       u8g2.drawHLine(x, 31, 3);
     }
+  }
+
+  // Pot indicator: bottom 8 rows, only while timer is live
+  if (millis() < pot_display_until_ms && active_pot_idx >= 0) {
+    const uint16_t vals[4] = {pot_cutoff, pot_reso, pot_envmod, pot_decay};
+    uint16_t val = vals[active_pot_idx];
+
+    u8g2.setDrawColor(0);
+    u8g2.drawBox(0, 32, 72, 8);
+    u8g2.setDrawColor(1);
+
+    u8g2.setFont(u8g2_font_5x7_tr);
+    u8g2.setCursor(0, 39);
+    u8g2.print(POT_NAMES[active_pot_idx]);
+
+    u8g2.drawFrame(21, 34, 50, 4);
+    int fill = (int)((uint32_t)val * 50 / 4095);
+    if (fill > 0) u8g2.drawBox(21, 34, fill, 4);
   }
 
   u8g2.sendBuffer();
@@ -188,6 +325,9 @@ static void render_display() {
 
 void setup() {
   Serial.begin(115200);
+
+  pinMode(TOUCH_OCTAVE_PIN,  INPUT);
+  pinMode(TOUCH_PATTERN_PIN, INPUT);
 
   Wire.begin(5, 6);
   Wire.setClock(400000);
@@ -205,6 +345,9 @@ void setup() {
 
 void loop() {
   read_pots();
+  read_touch();
+  active_pattern = touch_pattern ? pattern_b : pattern_a;
+
 
   for (int i = 0; i < AUDIO_BUF; i++) {
     if (samples_into_step == 0 || current_step < 0) {
